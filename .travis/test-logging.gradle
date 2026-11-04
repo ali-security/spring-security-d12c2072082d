@@ -1,0 +1,59 @@
+// Prints per-test failures, every skipped test with its reason, and a
+// per-module TEST SUMMARY so the Travis log states how many tests ran/passed.
+
+// Names why a test was skipped: the @Ignore/@Disabled annotation on the test
+// method or class in the project's own source (with its message, if any), or
+// otherwise a failed JUnit assumption.
+def skipReason(ClassLoader loader, String cls, String name) {
+	try {
+		def c = loader.loadClass(cls)
+		def m = c.declaredMethods.find { it.name == name }
+		for (target in [[m, 'method'], [c, 'class']]) {
+			if (target[0] == null) continue
+			for (a in target[0].annotations) {
+				def type = a.annotationType().name
+				if (type == 'org.junit.Ignore' || type == 'org.junit.jupiter.api.Disabled') {
+					def msg = a.value()
+					return "@${a.annotationType().simpleName} on the test ${target[1]} in upstream source" + (msg ? ": ${msg}" : " (no message given)")
+				}
+			}
+		}
+		return 'JUnit assumption not met at runtime (no @Ignore/@Disabled on the test)'
+	} catch (Throwable e) {
+		return "could not inspect test class: ${e}"
+	}
+}
+def totals = [tests: 0, passed: 0, failed: 0, skipped: 0]
+gradle.buildFinished {
+	println "TEST TOTAL (all test tasks): ${totals.tests} tests, ${totals.passed} passed, ${totals.failed} failed, ${totals.skipped} skipped"
+}
+allprojects {
+	tasks.withType(Test) { Test t ->
+		t.testLogging {
+			events 'failed'
+			exceptionFormat 'full'
+		}
+		def skipped = []
+		t.afterTest { desc, result ->
+			if (result.resultType == TestResult.ResultType.SKIPPED) {
+				skipped << [desc.className, desc.name]
+			}
+		}
+		t.afterSuite { desc, result ->
+			if (desc.parent == null) {
+				def loader = null
+				if (!skipped.isEmpty()) {
+					loader = new URLClassLoader(t.classpath.files.collect { it.toURI().toURL() } as URL[], (ClassLoader) null)
+				}
+				skipped.each { cls, name ->
+					t.logger.lifecycle("SKIPPED TEST ${t.project.path}: ${cls}.${name} (reason: ${skipReason(loader, cls, name)})")
+				}
+				totals.tests += result.testCount
+				totals.passed += result.successfulTestCount
+				totals.failed += result.failedTestCount
+				totals.skipped += result.skippedTestCount
+				t.logger.lifecycle("TEST SUMMARY ${t.project.path}:${t.name}: ${result.resultType} - ${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped")
+			}
+		}
+	}
+}
