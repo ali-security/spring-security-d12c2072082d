@@ -16,7 +16,12 @@ package org.springframework.security.crypto.bcrypt;
 
 import org.junit.Test;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -352,5 +357,85 @@ public class BCryptTests {
 		assertThat(BCrypt.equalsNoEarlyReturn("", "test")).isFalse();
 
 		assertThat(BCrypt.equalsNoEarlyReturn("test", "pass")).isFalse();
+	}
+
+	@Test
+	public void checkpwWhenZeroRoundsThenMatches() {
+		String password = "$2a$00$9N8N35BVs5TLqGL3pspAte5OWWA2a2aZIs.EGp7At7txYakFERMue";
+		assertThat(BCrypt.checkpw("password", password)).isTrue();
+		assertThat(BCrypt.checkpw("wrong", password)).isFalse();
+	}
+
+	@Test(expected = IllegalArgumentException.class)
+	public void hashpwWhenZeroRoundsThenFails() {
+		BCrypt.hashpw("password", "$2a$00$9N8N35BVs5TLqGL3pspAte5OWWA2a2aZIs.EGp7At7txYakFERMue");
+	}
+
+	// CVE-2022-22976: "1 << 31" overflowed so the maximum work factor performed no
+	// rounds at all and returned the zero-rounds hash instantly
+	@Test
+	public void hashpwWhenMaxLogRoundsThenRoundsAreNotSkipped() throws Exception {
+		String zeroRoundsHash = "$2a$00$9N8N35BVs5TLqGL3pspAte5OWWA2a2aZIs.EGp7At7txYakFERMue";
+		String maxRoundsSalt = "$2a$31$" + zeroRoundsHash.substring(7, 29);
+		assertNotCompletedWithinSeconds(MaxLogRounds.HASHPW, "password", maxRoundsSalt, 2);
+	}
+
+	// CVE-2022-22976: a stored hash with the maximum work factor must not be
+	// verified with zero rounds
+	@Test
+	public void checkpwWhenMaxLogRoundsThenRoundsAreNotSkipped() throws Exception {
+		String maxRoundsHash = "$2a$31$9N8N35BVs5TLqGL3pspAte5OWWA2a2aZIs.EGp7At7txYakFERMue";
+		assertNotCompletedWithinSeconds(MaxLogRounds.CHECKPW, "password", maxRoundsHash, 2);
+	}
+
+	/**
+	 * 2^31 rounds cannot complete within a unit test, whereas skipping the rounds
+	 * returns immediately. The call runs in a separate JVM that is destroyed once the
+	 * assertion has been made, so the 2^31 rounds do not keep burning CPU for the rest
+	 * of the test run.
+	 */
+	private static void assertNotCompletedWithinSeconds(String operation, String password, String salt,
+			long seconds) throws Exception {
+		String java = new File(new File(System.getProperty("java.home"), "bin"), "java").getPath();
+		String classpath = classpathOf(BCrypt.class) + File.pathSeparator + classpathOf(MaxLogRounds.class);
+		Process process = new ProcessBuilder(java, "-cp", classpath, MaxLogRounds.class.getName(), operation,
+				password, salt).redirectError(ProcessBuilder.Redirect.INHERIT).start();
+		try {
+			BufferedReader output = new BufferedReader(
+					new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8));
+			assertThat(output.readLine()).isEqualTo(MaxLogRounds.STARTED);
+			assertThat(process.waitFor(seconds, TimeUnit.SECONDS)).isFalse();
+		}
+		finally {
+			process.destroyForcibly().waitFor();
+		}
+	}
+
+	private static String classpathOf(Class<?> type) throws Exception {
+		return new File(type.getProtectionDomain().getCodeSource().getLocation().toURI()).getPath();
+	}
+
+	/**
+	 * Entry point of the separate JVM: reports that it started, then runs
+	 * {@link BCrypt#hashpw(String, String)} or {@link BCrypt#checkpw(String, String)}.
+	 */
+	public static final class MaxLogRounds {
+
+		static final String STARTED = "started";
+
+		static final String HASHPW = "hashpw";
+
+		static final String CHECKPW = "checkpw";
+
+		public static void main(String[] args) {
+			System.out.println(STARTED);
+			System.out.flush();
+			if (CHECKPW.equals(args[0])) {
+				BCrypt.checkpw(args[1], args[2]);
+			}
+			else {
+				BCrypt.hashpw(args[1], args[2]);
+			}
+		}
 	}
 }
